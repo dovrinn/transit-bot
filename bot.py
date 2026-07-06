@@ -93,4 +93,59 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        f"👋 Привіт! Я моніторю баланс транзиту.\n\n"
+        f"Твій Chat ID: <code>{chat_id}</code>\n\n"
+        f"Команди:\n"
+        f"/balance — показати поточний баланс\n"
+        f"/status — статус моніторингу",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global current_balance
+    balance_text = f"{current_balance:,.2f}" if current_balance is not None else "ще не перевірявся"
+    await update.message.reply_text(
+        f"🟢 Бот активний\n"
+        f"⏱ Інтервал перевірки: 10 хв\n"
+        f"💰 Останній відомий баланс: <b>{balance_text}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def post_init(application: Application) -> None:
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+    application.bot_data["db_pool"] = pool
+    logger.info("Підключено до БД")
+
+
+async def post_shutdown(application: Application) -> None:
+    pool: asyncpg.Pool = application.bot_data.get("db_pool")
+    if pool:
+        await pool.close()
+
+
+def main() -> None:
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.job_queue.run_repeating(
+        check_balance_job,
+        interval=CHECK_INTERVAL,
+        first=5,
+    )
+    logger.info("Бот запущено")
+    app.run_polling(allowed_updates=["message"])
+
+
+if __name__ == "__main__":
+    main()
