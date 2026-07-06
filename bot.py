@@ -14,19 +14,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── Config ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@host:5432/dbname")
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))  # куди надсилати алерти
 
 TRANSIT_BA = "cll20px0d0264y8uw4tehcs06"
-CHECK_INTERVAL = 10 * 60
+CHECK_INTERVAL = 10 * 60  # 10 хвилин у секундах
 
+# Порогове відхилення — алерт якщо баланс змінився більш ніж на N
+# 0 = алерт при будь-якій зміні (навіть 1 рупія)
 ALERT_THRESHOLD = 0
+# ──────────────────────────────────────────────────────────────────────────────
 
+# Поточний відомий баланс (зберігається в пам'яті)
 current_balance: Decimal | None = None
 
 
 async def get_balance(pool: asyncpg.Pool) -> Decimal:
+    """Отримує поточний баланс транзитного рахунку."""
     row = await pool.fetchrow(
         """
         SELECT COALESCE(SUM(amount), 0) AS balance
@@ -39,8 +45,14 @@ async def get_balance(pool: asyncpg.Pool) -> Decimal:
 
 
 async def check_balance_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Задача яка виконується кожні 10 хвилин."""
     global current_balance
-    pool: asyncpg.Pool = context.bot_data["db_pool"]
+
+    pool: asyncpg.Pool = context.bot_data.get("db_pool")
+    if pool is None:
+        logger.error("Пул БД недоступний, пропускаємо перевірку")
+        return
+
     try:
         new_balance = await get_balance(pool)
     except Exception as e:
@@ -51,8 +63,11 @@ async def check_balance_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML",
         )
         return
+
     if current_balance is None:
+        # Перший запуск — просто запам'ятовуємо
         current_balance = new_balance
+        logger.info(f"Початковий баланс: {current_balance:,.2f}")
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=(
@@ -62,7 +77,9 @@ async def check_balance_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="HTML",
         )
         return
+
     diff = new_balance - current_balance
+
     if abs(diff) > ALERT_THRESHOLD:
         direction = "📈 збільшився" if diff > 0 else "📉 зменшився"
         await context.bot.send_message(
@@ -75,13 +92,18 @@ async def check_balance_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             ),
             parse_mode="HTML",
         )
+        logger.info(f"Алерт: {current_balance} → {new_balance} (diff: {diff})")
         current_balance = new_balance
     else:
         logger.info(f"Баланс без змін: {new_balance:,.2f}")
 
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pool: asyncpg.Pool = context.bot_data["db_pool"]
+    """/balance — показати поточний баланс прямо зараз."""
+    pool: asyncpg.Pool = context.bot_data.get("db_pool")
+    if pool is None:
+        await update.message.reply_text("❌ БД недоступна. Перевір підключення.")
+        return
     try:
         balance = await get_balance(pool)
         await update.message.reply_text(
@@ -93,6 +115,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — привітання."""
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         f"👋 Привіт! Я моніторю баланс транзиту.\n\n"
@@ -105,6 +128,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — показати статус бота."""
     global current_balance
     balance_text = f"{current_balance:,.2f}" if current_balance is not None else "ще не перевірявся"
     await update.message.reply_text(
@@ -116,15 +140,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def post_init(application: Application) -> None:
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-    application.bot_data["db_pool"] = pool
-    logger.info("Підключено до БД")
+    """Підключення до БД після ініціалізації."""
+    try:
+        pool = await asyncpg.create_pool(
+            DATABASE_URL, min_size=1, max_size=3,
+            command_timeout=30, timeout=30,
+        )
+        application.bot_data["db_pool"] = pool
+        logger.info("Підключено до БД")
+    except Exception as e:
+        logger.error(f"Не вдалося підключитися до БД: {e}")
+        application.bot_data["db_pool"] = None
 
 
 async def post_shutdown(application: Application) -> None:
+    """Закриття пулу підключень."""
     pool: asyncpg.Pool = application.bot_data.get("db_pool")
     if pool:
         await pool.close()
+        logger.info("З'єднання з БД закрито")
 
 
 def main() -> None:
@@ -135,14 +169,18 @@ def main() -> None:
         .post_shutdown(post_shutdown)
         .build()
     )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("status", cmd_status))
+
+    # Запускаємо перевірку кожні 10 хвилин
     app.job_queue.run_repeating(
         check_balance_job,
         interval=CHECK_INTERVAL,
-        first=5,
+        first=5,  # перша перевірка через 5 секунд після старту
     )
+
     logger.info("Бот запущено")
     app.run_polling(allowed_updates=["message"])
 
